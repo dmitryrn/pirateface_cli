@@ -2,6 +2,7 @@
 
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -82,7 +83,7 @@ def build_torrent(src, save_dir, name, trackers, blocks=None):
     print(f"    {len(paths)} files included, {len(skipped)} skipped")
     print("==> Hashing and creating the torrent")
     sums = {}  # SHA-256 of each file, filled by the same read that hashes the pieces
-    data, v1, v2 = hybrid.build(save_dir / name, trackers, sums=sums, blocks=blocks)
+    data, v1, v2 = hybrid.build(save_dir / name, trackers, sums=sums, blocks=blocks, paths=paths)
     return paths, sums, data, v1, v2
 
 
@@ -140,6 +141,11 @@ def choose_license(repo, hf_license, sums, licenses, answers):
         raise SeedError(
             f"the {lic} license requires {need} in the torrent; download it into the model folder and rerun"
         )
+    if need and sums.get(need) == hashlib.sha256(b"").hexdigest():
+        raise SeedError(
+            f"the {lic} license requires {need} in the torrent, but it is empty; "
+            "download it into the model folder and rerun"
+        )
     return lic
 
 
@@ -151,7 +157,7 @@ def evidence_for(repo, revision, lic, match, direct, command, answers):
             f"the local copy (checked by {command})."
         )
     if direct:
-        return f"Direct listing: published on Pirate Face by {repo.split('/')[0]} itself, not on Hugging Face. License: {lic}."
+        return f"Direct listing: submitted directly to Pirate Face (not on Hugging Face). License: {lic}."
     print("    Where did this copy come from? Links, license proof, and why it's gone from Hugging Face if it is.")
     evidence = answers.ask("    Evidence: ", "evidence")
     if evidence is not None and len(evidence) < 30:
@@ -172,16 +178,11 @@ def request_body(repo, revision, lic, evidence, sums, data, v1, v2, readme, web_
         "manifest": [{"path": p, "sha256": h} for p, h in sorted(sums.items())],
         "torrent": base64.b64encode(data).decode(),  # lets the magnet work with no peer online
         "submissionTermsVersion": TERMS_VERSION,
-        **dict.fromkeys(
-            [
-                "redistributionConfirmed",
-                "accuracyConfirmed",
-                "reviewAcknowledged",
-                "privacyAcknowledged",
-                "termsAccepted",
-            ],
-            True,
-        ),
+        "redistributionConfirmed": True,
+        "accuracyConfirmed": True,
+        "reviewAcknowledged": True,
+        "privacyAcknowledged": True,
+        "termsAccepted": True,
     }
     # README.md is the model card. Pirate Face shows it for models that aren't on Hugging Face.
     if readme.is_file() and readme.stat().st_size <= 200_000:
@@ -255,7 +256,7 @@ def submit_new(
     # The shared-seeds default keeps each author in their own author--model folder (seed/package.py:seeds_folder
     # applies the same name; seed_listed reuses an old <model> folder that already holds the torrent). An
     # explicit out is used as given; pf submit's own ./pirateface-NAME default is one.
-    out = Path(out or Path(SEEDS, repo.replace("/", "--")))
+    out = out or Path(SEEDS, repo.replace("/", "--"))
     save_dir = out / "files"
     answers = Answers(dry_run)
     # The torrent carries this account's seeding tracker. Trackers are outside the info dict,
@@ -267,10 +268,7 @@ def submit_new(
         torrent_path = out / f"{name}.torrent"
         torrent_path.write_bytes(data)
 
-        try:
-            licenses = api.licenses()
-        except OSError as e:
-            raise SeedError(f"could not read the license list from {API}/api/licenses ({e})") from e
+        licenses = hub.licenses_or_fail()
         match = None
         if direct:
             # Direct listing: not on Hugging Face. The revision is the torrent's v1 infohash.
